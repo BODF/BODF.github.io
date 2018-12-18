@@ -1,0 +1,267 @@
+---
+title: "Exercise Data ML Analysis"
+author: "BODF"
+date: "12/14/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(caret)
+library(parallel)
+library(doParallel)
+```
+
+# Summary  
+The goal in this analysis is to build an algorithm that can detect the difference
+between effective and ineffective excercise. The data analyzed here come from http://groupware.les.inf.puc-rio.br/har, and 
+involve exercise data from six participants wearing three accelerometers. The 
+participants were asked to excercise correctly (Class A) or incorrectly in 
+various ways (Classes B thru E). 
+
+This 
+report first splits the 'training' data into training and test sets, and it also 
+imports the 'test' data as a validation set. The code of the report then reformats 
+the data and excludes unnecessary variables before fitting a random forest to 
+the training set data.
+
++ Citation: The data are from this paper  http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf
++ Footnote: I used the post from Len Greski, one of the class mentors, to make 
+my random forest model run in parallel, see here https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md.
+
+# Data formatting  
+The supplied data are of a rather raw format and need to be pre-processed. Here 
+are some examples of problems addressed in code that can be found in the raw 
+R markdown document (include = FALSE for most of my code).  
+
+* There are some variables of questionable worth to this analysis that should 
+be ignored (user names, raw timestamps, dates, the first column being an index)
+    + To be clear we want an algorithm that is generalizable. We could 
+certainly fit every variable and get a great fit, but it wouldn't be 
+useful in addressing the goal of this project.
+* Several numerical variables have empty data points. They are recorded as "", NA, 
+and "#DIV/0!". My csv import pushes all the missing values to NA.
+* Most of the variables have no missing values, but some variables 
+are over 90% missing. These are likely not imputable and I removed them (see raw 
+Rmd if interested).
+
+
+```{r Import}
+# Import the data and split the training data into train and test sets
+setwd("~/Documents/Classes/DataSciCourse/FitnessData/")
+training <- read.csv("pml-training.csv", na.strings = c("", " ", "#DIV/0!"))
+validation <- read.csv("pml-testing.csv", na.strings = c("", " ", "#DIV/0!"))
+set.seed(3232328)
+trainIndex <- createDataPartition(training$classe, p = 0.75,list=FALSE)
+testing <- training[-trainIndex,]
+training <- training[trainIndex,]; rm(trainIndex)
+```
+```{r reFormat, include=FALSE}
+reFormat <- function(x, y="classe"){
+# Remove date info. It is either irrelevant or could drive an erroneous over fitting
+x <- as_tibble(x)
+x <- x %>% select(-c(cvtd_timestamp, raw_timestamp_part_1, X, 
+                                   raw_timestamp_part_2, new_window, num_window))
+
+# Make some class conversions before removing vars with high % NA
+hold <- select(x, user_name, y)
+x <- select(x, -user_name, -y)
+x <- x %>% mutate_all(as.character) %>%
+        mutate_all(as.numeric)
+# The below code will fill vector 'v' with the column indices with less than 90%
+# NA content. I also tried as low as 10% and got the same answer. These columns 
+# with over 90% NA content are likely outliers and won't be imputable.
+v <- numeric()
+for(i in 1:dim(x)[2]){
+        if(mean(is.na(x[,i])) < 0.9){
+                v <- c(v,i)
+        }
+}
+x <- x[, v]
+
+# Recombine the separated data frames
+x <- as_tibble(cbind(hold, x))
+x
+}
+
+# Apply to train and test data sets
+training <- reFormat(training)
+testing <- reFormat(testing)
+validation <- reFormat(validation, y="problem_id")
+
+# Check for any remaining variables with near zero variance:
+# nearZeroVar(training) # gives back no variables
+```
+
+Before fitting a model, we should consider how many values are highly correlated. 
+(Highly correlated values could produce bias.) 
+I made a function that captures all correlations above a particular cut off value, 
+and have plotted the output below. As the cut off value increases, there is an 
+exponential decrease in the fraction of correlations meeting the cut off. A cut 
+off of 0.7 contains less than 2% of the data and I (somewhat arbitrarily) 
+chose it as a cut off for removing values from further analysis.
+
+```{r Correlations, include=FALSE}
+# Some of the remaining variables are highly correlated
+cor_data <- select(training, -user_name, -classe) # select only numeric
+
+corCutOff <- function(input_data, CutOff, greater = TRUE){ # defaults to values > cut off
+        correlations <- cor(input_data)
+        diag(correlations) <- 0 # The diagonal is not of interest
+        madmax <- apply(abs(correlations), 2, max) # find values that are large in size
+        high <- numeric()
+        if(greater){
+                high <- unique(correlations[correlations > CutOff])
+        } else{
+                high <- unique(correlations[correlations < CutOff])
+        }
+        matches <- !is.na(matrix(match(correlations, high), nrow = 52, 
+                ncol = 52, byrow = TRUE))
+        matches <- matrix(as.logical(matches*upper.tri(matches)), nrow = 52, 
+                ncol = 52, byrow=FALSE)
+        
+        # run the matches by row and by column against the known row names
+        caller <- rownames(correlations)
+        rows <- character()
+        cols <- character()
+        HighCor <- character()
+        for(i in 1:52){
+                rows <- caller[matches[i,]]
+                cols <- rep(caller[i], length(rows))
+                HighCor <- c(HighCor, paste(rows, cols, sep = " VS "))
+        }
+        HighCor
+}
+# 22 values that are highly correlated at (Cut off > 0.7)
+
+x <- seq(0.1, 0.9, 0.1)
+y <- numeric()
+for(value in x){
+        y <- c(y, length(corCutOff(cor_data, value)))
+}
+```
+```{r plot, echo=FALSE}
+plot(x,y/1326,type = 'b', pch = 16, lwd=1.5, xlab = "Abs(Correlation) Cut Off", ylab = 
+             "Fraction of Values Above the Mark", main = "Plot of correlation cut off versus\nthe fraction of values making the cut off")
+
+# Worth noting that we could use PCA at this juncture, but it does not make much 
+# sense to me. Many of the data values have a factorial aspect (huge change 
+# between classes). This produces a great deal of non-normality so that 
+# correlations would get canceled out in odd ways by PCA.
+
+# BoxCox was also attempted and proved unhelpful on a subset of variables
+```
+
+Based on a correlation cut-off of 0.7, there were 26 values that were highly 
+correlated. In some of the underlying code, I removed a subset of these variables 
+from the data and left their covariates behind, as listed here:  
+
+* total_accel_belt was used to represent accel_belt_x and y, roll_belt, yaw_belt, 
+magnet_belt_x
+* gyros_dumbbell_z for gyros_forearm_y and z
+* magnet_arm_z for magnet_arm_y and accel_arm_z
+* accel_arm_x for magnet_arm_x
+* magnet_belt_z for magnet_belt_y
+* magnet_dumbbell_y for gyros_belt_x
+* accel_forearm_y for magnet_forearm_y
+* accel_dumbell_x for pitch_dumbbell
+* accel_dumbell_z for yaw_dumbbell
+* total_accel_dumbbell for accel_dumbbell_y
+
++ Footnote: I also considered using PCA to remove the correlated aspects of the data, but 
+decided against it due to the non-normality and discontinuous nature of some of 
+the data.
+
+```{r SelectionAndDummies, include = FALSE}
+# Select out data that will not be used in fitting
+training <- training %>% 
+        select(-c(accel_belt_x, accel_belt_y, roll_belt, yaw_belt, magnet_belt_x, 
+                  gyros_forearm_y, gyros_forearm_z, magnet_arm_y, accel_arm_z, 
+                  magnet_arm_x,  magnet_belt_y, gyros_belt_x, magnet_forearm_y, 
+                  pitch_dumbbell, yaw_dumbbell, accel_dumbbell_y, user_name))
+testing <- testing %>% 
+        select(-c(accel_belt_x, accel_belt_y, roll_belt, yaw_belt, magnet_belt_x, 
+                  gyros_forearm_y, gyros_forearm_z, magnet_arm_y, accel_arm_z, 
+                  magnet_arm_x, magnet_belt_y, gyros_belt_x, magnet_forearm_y, 
+                  pitch_dumbbell, yaw_dumbbell, accel_dumbbell_y, user_name))
+validation <- validation %>% 
+        select(-c(accel_belt_x, accel_belt_y, roll_belt, yaw_belt, problem_id, 
+                  magnet_belt_x, gyros_forearm_y, gyros_forearm_z, 
+                  magnet_arm_y, accel_arm_z, magnet_arm_x, 
+                  magnet_belt_y, gyros_belt_x, magnet_forearm_y,
+                  pitch_dumbbell, yaw_dumbbell, accel_dumbbell_y, 
+                  user_name))
+
+training <- as.data.frame(training)
+testing <- as.data.frame(testing)
+validation <- as.data.frame(validation)
+# Make a dummy variable series for 'user_name'
+#dummiesTrain <- dummyVars(~ user_name, data = training) # build prediction set
+#dummiesTest <- dummyVars(~ user_name, data = testing)
+#dummiesVal <- dummyVars(~ user_name, data=validation)
+
+#dummiesTrain <- predict(dummiesTrain, newdata=training) # apply to make matrix
+#dummiesTest <- predict(dummiesTest, newdata=testing)
+#dummiesVal <- predict(dummiesVal, newdata=validation)
+
+#training <- select(training, -user_name) # remove old factor variable
+#testing <- select(testing, -user_name)
+#validation <- select(validation, -user_name)
+
+#training <- cbind(dummiesTrain, training) # combine
+#testing <- cbind(dummiesTest, testing)
+#validation <- cbind(dummiesVal, validation)
+#rm(dummiesTrain, dummiesTest, dummiesVal) # free up memory
+```
+
+# Modeling  
+Because we are dealing with categorical outcomes, let's try fitting a random forest 
+("rf") to the data. This will produce a series of decision trees and make 
+predictions based on the average of the trees.
+
+For this particular fit, I used 
+K-fold cross validation (5 fold) wherein the data are split into five groups, 
+and fit five times. In each fitting step, one of the groups is chosen as the 
+internal 'testing' group and this role is shifted to the next group with each 
+fitting step. As an extra validation step, I also compare the fit to the test 
+data that I set aside at the beginning of this analysis.
+
+```{r Modeling}
+# separate dependent and independent vars
+x <- training[,-1]
+y <- training[,1]
+
+# set up parallel processing, this code fragment is from Len Greski's GitHub post
+# see the footnote at the begining of the doc
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+# set up train control
+control <- trainControl(method = 'cv', number = 5, allowParallel = TRUE)
+
+# Fitting, takes less than six mins with 7 cores on MB pro
+set.seed(33543)
+mdlRfor <- train(x,y, method = 'rf', trControl = control)
+stopCluster(cluster)
+registerDoSEQ()
+
+confusionMatrix.train(mdlRfor) # Give the prediction matrix
+```
+
+As the confusion matrix above illustrates, the final model has a high in-sample 
+accuracy of about 99%. This is similar to the out-of sample accuracy, seen in the 
+confusion matrix for the test data set, below:
+
+```{r testing, include = TRUE} 
+confusionMatrix(predict(mdlRfor, testing), testing$classe)
+```
+
+The validation data were not supplied with their actual 'classe' values, so it is 
+unclear how accurate my model is on the validation data. Nonetheless, here are 
+the predictions: `r predict(mdlRfor, validation)`
+
+# Conclusion  
+The prediction algorithm appears to work, as it is 
+able to accurately detect the difference between five different classes of excercise.
